@@ -1,0 +1,126 @@
+name: Cache Anything
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  update-cache:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Récupérer la branche main dans le répertoire "main"
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          path: main
+          fetch-depth: 0  # pour avoir tout l'historique
+
+      # 2. S'assurer que la branche "cache" existe (sinon, la créer comme branche orpheline)
+      - name: Ensure cache branch exists
+        run: |
+          cd main
+          git fetch origin
+          if ! git ls-remote --exit-code origin cache; then
+            echo "Cache branch does not exist, creating orphan branch 'cache'"
+            git config --global user.name "github-actions"
+            git config --global user.email "actions@github.com"
+            git checkout --orphan cache
+            git rm -rf .
+            echo '*.cached filter=lfs diff=lfs merge=lfs -text' > .gitattributes
+            git add .gitattributes
+            git commit --allow-empty -m "initialise cache branch"
+            git push origin cache
+            git checkout main
+          else
+            echo "Cache branch exists"
+          fi
+        shell: bash
+
+      # 3. Lister les fichiers .tocache modifiés dans le commit déclencheur
+      #    Attention, la liste peut être multi‑ligne.
+      - name: Lister les fichiers .tocache modifiés dans le commit déclencheur
+        id: list_tocache
+        run: |
+          cd main
+          CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep '\.tocache$' || true)
+          echo "Fichiers modifiés :"
+          echo "$CHANGED_FILES"
+          echo "CHANGED_FILES<<EOF" >> $GITHUB_ENV
+          echo "$CHANGED_FILES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+        shell: bash
+
+      # 4. Arrêter le workflow s'il n'y a aucun fichier .tocache modifié
+      - name: Sortir s'il n'y a aucun fichier .tocache modifié
+        run: |
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "Aucun fichier .tocache modifié. Fin du workflow."
+            exit 0
+          fi
+        shell: bash
+
+      # 5. Checkout de la branche cache (avec LFS activé) dans le répertoire "cache"
+      - name: Checkout branch cache with LFS
+        uses: actions/checkout@v4
+        with:
+          ref: cache
+          path: cache
+          fetch-depth: 0
+          lfs: true
+
+      # 6. Pour chacun des fichiers .tocache modifiés, télécharger (si besoin) le fichier final
+      #    sur la branche cache (extension .cached) en vérifiant le hash SHA256.
+      - name: Traiter les fichiers .tocache modifiés
+        run: |
+          # Assurer l'installation et l'activation de Git LFS
+          git lfs install
+          cd main
+          # La variable CHANGED_FILES pouvant être multi‑ligne, on la lit ligne par ligne.
+          echo "$CHANGED_FILES" | while IFS= read -r CACHE_FILE; do
+              # Ignorer les lignes vides
+              if [ -z "$CACHE_FILE" ]; then continue; fi
+              echo "Traitement de $CACHE_FILE"
+              # Extraire l'URL et le hash attendu depuis le fichier .tocache
+              URL=$(head -n 1 "$CACHE_FILE")
+              EXPECTED_HASH=$(sed -n '2p' "$CACHE_FILE")
+              # Le fichier final dans la branche cache aura l'extension .cached
+              FINAL_FILE="${CACHE_FILE%.tocache}.cached"
+              echo "URL: $URL"
+              echo "Hash attendu: $EXPECTED_HASH"
+              echo "Fichier final: $FINAL_FILE"
+              # Vérifier si le fichier existe dans la branche cache
+              if [ -f "../cache/$FINAL_FILE" ]; then
+                  ACTUAL_HASH=$(sha256sum "../cache/$FINAL_FILE" | awk '{print $1}')
+                  if [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ]; then
+                      echo "Le hash de $FINAL_FILE est identique. Rien à faire."
+                      continue
+                  else
+                      echo "Le hash de $FINAL_FILE diffère. Téléchargement requis."
+                  fi
+              else
+                  echo "Le fichier ../cache/$FINAL_FILE n'existe pas. Téléchargement requis."
+              fi
+              # Créer le dossier de destination dans la branche cache s'il n'existe pas
+              mkdir -p "../cache/$(dirname "$FINAL_FILE")"
+              curl -L -o "../cache/$FINAL_FILE" "$URL"
+          done
+        shell: bash
+
+      # 7. Committer et pousser les modifications sur la branche cache
+      - name: Commit et push sur la branche cache
+        run: |
+          cd cache
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add .
+            git commit -m "Mise à jour du cache depuis le commit $GITHUB_SHA"
+            git push origin cache
+          else
+            echo "Aucun changement détecté dans la branche cache."
+          fi
+        shell: bash
